@@ -43,13 +43,17 @@ impl IcebergCatalogProvider {
     /// using the given client to fetch and initialize schema providers for
     /// each namespace in the Iceberg [`Catalog`].
     ///
-    /// This method retrieves the list of namespace names
-    /// attempts to create a schema provider for each namespace, and
-    /// collects these providers into a `HashMap`.
+    /// This method retrieves the list of namespace names, attempts to create a
+    /// schema provider for each namespace, and collects these providers into a
+    /// `HashMap`.
+    ///
+    /// The list of namespaces and the table names within each namespace are
+    /// captured eagerly. Per-table metadata is loaded lazily on each query by
+    /// the underlying [`IcebergSchemaProvider`], so query results are never
+    /// stale. The cached namespace and table-name lists may go out of sync if
+    /// namespaces or tables are created / dropped through other means; call
+    /// [`Self::try_new`] again to refresh them.
     pub async fn try_new(client: Arc<dyn Catalog>) -> Result<Self> {
-        // TODO:
-        // Schemas and providers should be cached and evicted based on time
-        // As of right now; schemas might become stale.
         let schema_names: Vec<_> = client
             .list_namespaces(None)
             .await?

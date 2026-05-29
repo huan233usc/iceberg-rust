@@ -19,14 +19,13 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::DashSet;
 use datafusion::catalog::SchemaProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
-use futures::future::try_join_all;
 use iceberg::arrow::arrow_schema_to_schema_auto_assign_ids;
 use iceberg::inspect::MetadataTableType;
 use iceberg::{Catalog, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent};
@@ -36,60 +35,73 @@ use crate::to_datafusion_error;
 
 /// Represents a [`SchemaProvider`] for the Iceberg [`Catalog`], managing
 /// access to table providers within a specific namespace.
+///
+/// Only the **set of table names** is cached at construction time.
+/// [`IcebergTableProvider`]s are loaded lazily from the catalog on each
+/// [`SchemaProvider::table`] call so query results always reflect the latest
+/// table metadata.
+///
+/// The cached name set is updated by [`SchemaProvider::register_table`] and
+/// [`SchemaProvider::deregister_table`]. It may still go out of sync if tables
+/// are created or dropped through other means; call
+/// [`IcebergSchemaProvider::try_new`] again to refresh it.
 #[derive(Debug)]
 pub(crate) struct IcebergSchemaProvider {
     /// Reference to the Iceberg catalog
     catalog: Arc<dyn Catalog>,
     /// The namespace this schema represents
     namespace: NamespaceIdent,
-    /// A concurrent map where keys are table names
-    /// and values are dynamic references to objects implementing the
-    /// [`TableProvider`] trait.
+    /// Cached set of table names in this namespace, used to back the synchronous
+    /// `table_names`/`table_exist` calls.
     /// Wrapped in Arc to allow sharing across async boundaries in register_table.
-    tables: Arc<DashMap<String, Arc<IcebergTableProvider>>>,
+    table_names: Arc<DashSet<String>>,
 }
 
 impl IcebergSchemaProvider {
     /// Asynchronously tries to construct a new [`IcebergSchemaProvider`]
-    /// using the given client to fetch and initialize table providers for
-    /// the provided namespace in the Iceberg [`Catalog`].
+    /// using the given client to fetch the list of table names in the
+    /// provided namespace in the Iceberg [`Catalog`].
     ///
-    /// This method retrieves a list of table names
-    /// attempts to create a table provider for each table name, and
-    /// collects these providers into a `HashMap`.
+    /// Only table names are loaded; [`IcebergTableProvider`]s are constructed
+    /// lazily on demand by [`SchemaProvider::table`].
     pub(crate) async fn try_new(
         client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
     ) -> Result<Self> {
-        // TODO:
-        // Tables and providers should be cached based on table_name
-        // if we have a cache miss; we update our internal cache & check again
-        // As of right now; tables might become stale.
-        let table_names: Vec<_> = client
+        let table_names: DashSet<String> = client
             .list_tables(&namespace)
             .await?
             .iter()
             .map(|tbl| tbl.name().to_string())
             .collect();
 
-        let providers = try_join_all(
-            table_names
-                .iter()
-                .map(|name| IcebergTableProvider::try_new(client.clone(), namespace.clone(), name))
-                .collect::<Vec<_>>(),
-        )
-        .await?;
-
-        let tables = Arc::new(DashMap::new());
-        for (name, provider) in table_names.into_iter().zip(providers.into_iter()) {
-            tables.insert(name, Arc::new(provider));
-        }
-
         Ok(IcebergSchemaProvider {
             catalog: client,
             namespace,
-            tables,
+            table_names: Arc::new(table_names),
         })
+    }
+
+    /// Lazily load an [`IcebergTableProvider`] for `name` from the catalog.
+    ///
+    /// Returns `Ok(None)` if `name` is not in the cached name set, or if the
+    /// catalog reports the table no longer exists. In the latter case, the
+    /// stale entry is evicted from the cache.
+    async fn load_table_provider(&self, name: &str) -> DFResult<Option<IcebergTableProvider>> {
+        if !self.table_names.contains(name) {
+            return Ok(None);
+        }
+
+        match IcebergTableProvider::try_new(self.catalog.clone(), self.namespace.clone(), name)
+            .await
+        {
+            Ok(provider) => Ok(Some(provider)),
+            Err(err) if matches!(err.kind(), ErrorKind::TableNotFound) => {
+                self.table_names.remove(name);
+                Ok(None)
+            }
+            Err(err) => Err(to_datafusion_error(err)),
+        }
     }
 }
 
@@ -100,7 +112,7 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables
+        self.table_names
             .iter()
             .flat_map(|entry| {
                 let table_name = entry.key().clone();
@@ -117,10 +129,10 @@ impl SchemaProvider for IcebergSchemaProvider {
 
     fn table_exist(&self, name: &str) -> bool {
         if let Some((table_name, metadata_table_name)) = name.split_once('$') {
-            self.tables.contains_key(table_name)
+            self.table_names.contains(table_name)
                 && MetadataTableType::try_from(metadata_table_name).is_ok()
         } else {
-            self.tables.contains_key(name)
+            self.table_names.contains(name)
         }
     }
 
@@ -128,21 +140,20 @@ impl SchemaProvider for IcebergSchemaProvider {
         if let Some((table_name, metadata_table_name)) = name.split_once('$') {
             let metadata_table_type =
                 MetadataTableType::try_from(metadata_table_name).map_err(DataFusionError::Plan)?;
-            if let Some(table) = self.tables.get(table_name) {
-                let metadata_table = table
-                    .metadata_table(metadata_table_type)
-                    .await
-                    .map_err(to_datafusion_error)?;
-                return Ok(Some(Arc::new(metadata_table)));
-            } else {
+            let Some(provider) = self.load_table_provider(table_name).await? else {
                 return Ok(None);
-            }
+            };
+            let metadata_table = provider
+                .metadata_table(metadata_table_type)
+                .await
+                .map_err(to_datafusion_error)?;
+            return Ok(Some(Arc::new(metadata_table)));
         }
 
         Ok(self
-            .tables
-            .get(name)
-            .map(|entry| entry.value().clone() as Arc<dyn TableProvider>))
+            .load_table_provider(name)
+            .await?
+            .map(|p| Arc::new(p) as Arc<dyn TableProvider>))
     }
 
     fn register_table(
@@ -171,7 +182,7 @@ impl SchemaProvider for IcebergSchemaProvider {
 
         let catalog = self.catalog.clone();
         let namespace = self.namespace.clone();
-        let tables = self.tables.clone();
+        let table_names = self.table_names.clone();
         let name_clone = name.clone();
 
         // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
@@ -189,17 +200,7 @@ impl SchemaProvider for IcebergSchemaProvider {
                     .await
                     .map_err(to_datafusion_error)?;
 
-                // Create a new table provider using the catalog reference
-                let table_provider = IcebergTableProvider::try_new(
-                    catalog.clone(),
-                    namespace.clone(),
-                    name_clone.clone(),
-                )
-                .await
-                .map_err(to_datafusion_error)?;
-
-                // Store the new table provider
-                tables.insert(name_clone, Arc::new(table_provider));
+                table_names.insert(name_clone);
 
                 Ok(None)
             })
@@ -220,25 +221,34 @@ impl SchemaProvider for IcebergSchemaProvider {
 
         let catalog = self.catalog.clone();
         let namespace = self.namespace.clone();
-        let tables = self.tables.clone();
+        let table_names = self.table_names.clone();
         let table_name = name.to_string();
 
         // Use tokio's spawn_blocking to handle the async work on a blocking thread pool
         let result = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async move {
+                // Load a snapshot of the provider before dropping so we can
+                // return it from this method per the SchemaProvider contract.
+                // If the table has already been dropped externally we fall
+                // back to `None`.
+                let removed = IcebergTableProvider::try_new(
+                    catalog.clone(),
+                    namespace.clone(),
+                    table_name.clone(),
+                )
+                .await
+                .ok()
+                .map(|p| Arc::new(p) as Arc<dyn TableProvider>);
+
                 let table_ident = TableIdent::new(namespace, table_name.clone());
 
-                // Drop the table from the Iceberg catalog
                 catalog
                     .drop_table(&table_ident)
                     .await
                     .map_err(to_datafusion_error)?;
 
-                // Remove from local cache and return the removed provider
-                let removed = tables
-                    .remove(&table_name)
-                    .map(|(_, table)| table as Arc<dyn TableProvider>);
+                table_names.remove(&table_name);
 
                 Ok(removed)
             })
@@ -292,12 +302,23 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent};
+    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
     use tempfile::TempDir;
 
     use super::*;
 
     async fn create_test_schema_provider() -> (IcebergSchemaProvider, TempDir) {
+        let (provider, _catalog, _ns, temp_dir) = create_test_schema_provider_with_catalog().await;
+        (provider, temp_dir)
+    }
+
+    async fn create_test_schema_provider_with_catalog() -> (
+        IcebergSchemaProvider,
+        Arc<dyn Catalog>,
+        NamespaceIdent,
+        TempDir,
+    ) {
         let temp_dir = TempDir::new().unwrap();
         let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
 
@@ -308,6 +329,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
 
         let namespace = NamespaceIdent::new("test_ns".to_string());
         catalog
@@ -315,11 +337,21 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = IcebergSchemaProvider::try_new(Arc::new(catalog), namespace)
+        let provider = IcebergSchemaProvider::try_new(catalog.clone(), namespace.clone())
             .await
             .unwrap();
 
-        (provider, temp_dir)
+        (provider, catalog, namespace, temp_dir)
+    }
+
+    fn iceberg_schema() -> Schema {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -441,5 +473,100 @@ mod tests {
         let result = schema_provider.deregister_table("nonexistent");
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_table_lazy_loads_existing_table() {
+        // Create a table directly via the catalog before constructing the
+        // schema provider so we can verify that `try_new` only loads the
+        // table name (not the provider) and that `table()` lazy-loads on
+        // demand.
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_path = temp_dir.path().to_str().unwrap().to_string();
+
+        let catalog = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path.clone())]),
+            )
+            .await
+            .unwrap();
+        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+
+        let namespace = NamespaceIdent::new("test_ns".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .unwrap();
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("preexisting".to_string())
+                    .schema(iceberg_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let schema_provider = IcebergSchemaProvider::try_new(catalog.clone(), namespace.clone())
+            .await
+            .unwrap();
+
+        assert!(schema_provider.table_exist("preexisting"));
+
+        let provider = schema_provider.table("preexisting").await.unwrap();
+        assert!(provider.is_some(), "expected lazy-loaded table provider");
+        assert_eq!(
+            provider.unwrap().schema().fields().len(),
+            1,
+            "lazy-loaded provider should expose the table schema",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_table_returns_none_for_unknown_table() {
+        let (schema_provider, _temp_dir) = create_test_schema_provider().await;
+
+        let result = schema_provider.table("does_not_exist").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_table_evicts_externally_dropped_entry() {
+        // When a table is removed from the catalog out-of-band, the next
+        // `table()` call should report it as missing and evict the stale
+        // entry from the local name cache.
+        let (schema_provider, catalog, namespace, _temp_dir) =
+            create_test_schema_provider_with_catalog().await;
+
+        catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("ghost".to_string())
+                    .schema(iceberg_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        // Manually seed the cache, simulating a previous `try_new` snapshot
+        // that observed this table.
+        schema_provider.table_names.insert("ghost".to_string());
+        assert!(schema_provider.table_exist("ghost"));
+
+        catalog
+            .drop_table(&TableIdent::new(namespace.clone(), "ghost".to_string()))
+            .await
+            .unwrap();
+
+        let result = schema_provider.table("ghost").await.unwrap();
+        assert!(result.is_none(), "stale entry should resolve to None");
+        assert!(
+            !schema_provider.table_exist("ghost"),
+            "stale entry should be evicted after a missing lookup",
+        );
     }
 }
