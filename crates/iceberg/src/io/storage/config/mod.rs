@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// TODO Add specific configs
 //! Storage configuration for storage backends.
 //!
 //! This module provides configuration types for various storage backends.
@@ -50,7 +49,6 @@ use serde::{Deserialize, Serialize};
 /// This struct contains only configuration properties without specifying
 /// which storage backend to use. The storage type is determined by the
 /// explicit factory selection.
-/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StorageConfig {
     /// Configuration properties for the storage backend
