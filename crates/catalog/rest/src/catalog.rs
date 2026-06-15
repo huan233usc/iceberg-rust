@@ -17,13 +17,14 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
+use iceberg::scan::{FileScanTaskStream, ScanPlanRequest};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
@@ -40,6 +41,8 @@ use typed_builder::TypedBuilder;
 use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
+use crate::scan_planning::endpoint::Endpoint;
+use crate::scan_planning::{PlanScanContext, plan_table_scan};
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
     CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
@@ -215,6 +218,40 @@ impl RestCatalogConfig {
         ])
     }
 
+    /// `POST .../tables/{table}/plan` — submit a scan for server-side planning.
+    pub(crate) fn scan_plan_endpoint(&self, table: &TableIdent) -> String {
+        self.url_prefixed(&[
+            "namespaces",
+            &table.namespace.to_url_string(),
+            "tables",
+            &table.name,
+            "plan",
+        ])
+    }
+
+    /// `.../tables/{table}/plan/{plan-id}` — poll or cancel an async plan.
+    pub(crate) fn scan_plan_id_endpoint(&self, table: &TableIdent, plan_id: &str) -> String {
+        self.url_prefixed(&[
+            "namespaces",
+            &table.namespace.to_url_string(),
+            "tables",
+            &table.name,
+            "plan",
+            plan_id,
+        ])
+    }
+
+    /// `POST .../tables/{table}/tasks` — fetch tasks for a plan-task token.
+    pub(crate) fn scan_tasks_endpoint(&self, table: &TableIdent) -> String {
+        self.url_prefixed(&[
+            "namespaces",
+            &table.namespace.to_url_string(),
+            "tables",
+            &table.name,
+            "tasks",
+        ])
+    }
+
     /// Get the client from the config.
     pub(crate) fn client(&self) -> Option<Client> {
         self.client.clone()
@@ -342,21 +379,30 @@ impl RestCatalogConfig {
 
 #[derive(Debug)]
 struct RestContext {
-    client: HttpClient,
+    client: Arc<HttpClient>,
     /// Runtime config is fetched from rest server and stored here.
     ///
     /// It's could be different from the user config.
     config: RestCatalogConfig,
+    /// Endpoints advertised by the server, used for capability negotiation
+    /// (e.g. gating server-side scan planning). Empty when the server does not
+    /// advertise an `endpoints` list.
+    endpoints: Arc<HashSet<Endpoint>>,
 }
 
 /// Rest catalog implementation.
-#[derive(Debug)]
+///
+/// `Clone` is cheap: `ctx` is shared via `Arc` (so clones share the negotiated
+/// runtime context), as are the storage factory and runtime. Cloning is used to
+/// hand an `Arc<dyn Catalog>` self-handle to the tables this catalog loads, so
+/// their scans can call back into [`Catalog::plan_table_scan`].
+#[derive(Debug, Clone)]
 pub struct RestCatalog {
     /// User config is stored as-is and never be changed.
     ///
     /// It could be different from the config fetched from the server and used at runtime.
     user_config: RestCatalogConfig,
-    ctx: OnceCell<RestContext>,
+    ctx: Arc<OnceCell<RestContext>>,
     /// Storage factory for creating FileIO instances.
     storage_factory: Option<Arc<dyn StorageFactory>>,
     runtime: Runtime,
@@ -371,7 +417,7 @@ impl RestCatalog {
     ) -> Self {
         Self {
             user_config: config,
-            ctx: OnceCell::new(),
+            ctx: Arc::new(OnceCell::new()),
             storage_factory,
             runtime,
         }
@@ -412,10 +458,16 @@ impl RestCatalog {
             .get_or_try_init(|| async {
                 let client = HttpClient::new(&self.user_config)?;
                 let catalog_config = RestCatalog::load_config(&client, &self.user_config).await?;
+                let endpoints: HashSet<Endpoint> =
+                    catalog_config.endpoints.iter().cloned().collect();
                 let config = self.user_config.clone().merge_with_config(catalog_config);
                 let client = client.update_with(&config)?;
 
-                Ok(RestContext { config, client })
+                Ok(RestContext {
+                    config,
+                    client: Arc::new(client),
+                    endpoints: Arc::new(endpoints),
+                })
             })
             .await
     }
@@ -486,6 +538,13 @@ impl RestCatalog {
         let file_io = FileIOBuilder::new(factory).with_props(props).build();
 
         Ok(file_io)
+    }
+
+    /// Returns an `Arc<dyn Catalog>` self-handle to attach to tables so their
+    /// scans can delegate planning back to this catalog. Cheap — clones only
+    /// `Arc`/config handles (see the type's `Clone` note).
+    fn catalog_handle(&self) -> Arc<dyn Catalog> {
+        Arc::new(self.clone())
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
@@ -805,7 +864,8 @@ impl Catalog for RestCatalog {
             .identifier(table_ident.clone())
             .file_io(file_io)
             .metadata(response.metadata)
-            .runtime(self.runtime.clone());
+            .runtime(self.runtime.clone())
+            .catalog(self.catalog_handle());
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
@@ -862,7 +922,8 @@ impl Catalog for RestCatalog {
             .identifier(table_ident.clone())
             .file_io(file_io)
             .metadata(response.metadata)
-            .runtime(self.runtime.clone());
+            .runtime(self.runtime.clone())
+            .catalog(self.catalog_handle());
 
         if let Some(metadata_location) = response.metadata_location {
             table_builder.metadata_location(metadata_location).build()
@@ -999,6 +1060,7 @@ impl Catalog for RestCatalog {
             .metadata(response.metadata)
             .metadata_location(metadata_location.clone())
             .runtime(self.runtime.clone())
+            .catalog(self.catalog_handle())
             .build()
     }
 
@@ -1072,7 +1134,35 @@ impl Catalog for RestCatalog {
             .metadata(response.metadata)
             .metadata_location(response.metadata_location)
             .runtime(self.runtime.clone())
+            .catalog(self.catalog_handle())
             .build()
+    }
+
+    /// Plan a table scan on the server using the REST scan-planning protocol.
+    ///
+    /// Returns [`ErrorKind::FeatureUnsupported`] if the server does not
+    /// advertise the planning endpoints, which makes the scan engine fall back
+    /// to native, client-side planning.
+    async fn plan_table_scan(&self, request: ScanPlanRequest) -> Result<FileScanTaskStream> {
+        request.validate()?;
+        let context = self.context().await?;
+        let ctx = PlanScanContext {
+            client: context.client.clone(),
+            config: context.config.clone(),
+            endpoints: context.endpoints.clone(),
+            runtime: self.runtime.clone(),
+            table_ident: request.table_ident,
+            metadata: request.metadata,
+            snapshot_schema: request.snapshot_schema,
+            project_field_ids: request.project_field_ids,
+            case_sensitive: request.case_sensitive,
+            snapshot_id: request.snapshot_id,
+            start_snapshot_id: request.start_snapshot_id,
+            end_snapshot_id: request.end_snapshot_id,
+            select: request.select,
+            filter: request.filter,
+        };
+        plan_table_scan(ctx).await
     }
 }
 
@@ -2344,6 +2434,219 @@ mod tests {
 
         config_mock.assert_async().await;
         rename_table_mock.assert_async().await;
+    }
+
+    /// Config mock that advertises the server-side scan-planning endpoints.
+    async fn create_scan_planning_config_mock(server: &mut ServerGuard) -> Mock {
+        server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "overrides": { "warehouse": "s3://iceberg-catalog" },
+                "defaults": {},
+                "endpoints": [
+                    "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan/{plan-id}",
+                    "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/tasks",
+                    "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}/plan/{plan-id}"
+                ]
+            }"#,
+            )
+            .create_async()
+            .await
+    }
+
+    fn data_file_json(path: &str, size: u64, records: u64) -> serde_json::Value {
+        json!({
+            "spec-id": 0,
+            "content": "data",
+            "file-path": path,
+            "file-format": "parquet",
+            "file-size-in-bytes": size,
+            "record-count": records
+        })
+    }
+
+    async fn load_scan_test_table(catalog: &RestCatalog) -> Table {
+        catalog
+            .load_table(&TableIdent::new(
+                NamespaceIdent::new("ns1".to_string()),
+                "test1".to_string(),
+            ))
+            .await
+            .unwrap()
+    }
+
+    fn scan_test_catalog(server: &ServerGuard) -> RestCatalog {
+        RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+            Runtime::current(),
+        )
+    }
+
+    async fn collect_paths(table: &Table) -> Vec<String> {
+        use futures::TryStreamExt;
+        let snapshot_id = table.metadata().current_snapshot().unwrap().snapshot_id();
+        let tasks: Vec<_> = table
+            .scan()
+            .snapshot_id(snapshot_id)
+            .build()
+            .unwrap()
+            .plan_files()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        tasks
+            .into_iter()
+            .map(|t: iceberg::scan::FileScanTask| t.data_file_path)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_server_scan_planning_completed_inline() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_scan_planning_config_mock(&mut server).await;
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/load_table_response.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .create_async()
+            .await;
+        let plan_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1/plan")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "status": "completed",
+                    "file-scan-tasks": [
+                        { "data-file": data_file_json("s3://warehouse/t/data/a.parquet", 697, 1) }
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let catalog = scan_test_catalog(&server);
+        let table = load_scan_test_table(&catalog).await;
+        let paths = collect_paths(&table).await;
+
+        assert_eq!(paths, vec!["s3://warehouse/t/data/a.parquet".to_string()]);
+        config_mock.assert_async().await;
+        load_mock.assert_async().await;
+        plan_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_server_scan_planning_submitted_then_polled() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_scan_planning_config_mock(&mut server).await;
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/load_table_response.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .create_async()
+            .await;
+        let submit_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1/plan")
+            .with_status(200)
+            .with_body(json!({ "status": "submitted", "plan-id": "p1" }).to_string())
+            .create_async()
+            .await;
+        // First poll returns completed immediately (no backoff sleep needed).
+        let poll_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1/plan/p1")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "status": "completed",
+                    "file-scan-tasks": [
+                        { "data-file": data_file_json("s3://warehouse/t/data/b.parquet", 1, 1) }
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let catalog = scan_test_catalog(&server);
+        let table = load_scan_test_table(&catalog).await;
+        let paths = collect_paths(&table).await;
+
+        assert_eq!(paths, vec!["s3://warehouse/t/data/b.parquet".to_string()]);
+        config_mock.assert_async().await;
+        load_mock.assert_async().await;
+        submit_mock.assert_async().await;
+        poll_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_server_scan_planning_plan_task_fanout() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_scan_planning_config_mock(&mut server).await;
+        let load_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body_from_file(format!(
+                "{}/testdata/load_table_response.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .create_async()
+            .await;
+        // Completed with an inline task plus a plan-task token to fetch.
+        let plan_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1/plan")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "status": "completed",
+                    "file-scan-tasks": [
+                        { "data-file": data_file_json("s3://warehouse/t/data/inline.parquet", 1, 1) }
+                    ],
+                    "plan-tasks": ["task-1"]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        // fetchScanTasks returns one more task (and no further plan-tasks).
+        let tasks_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1/tasks")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "file-scan-tasks": [
+                        { "data-file": data_file_json("s3://warehouse/t/data/fetched.parquet", 1, 1) }
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let catalog = scan_test_catalog(&server);
+        let table = load_scan_test_table(&catalog).await;
+        let mut paths = collect_paths(&table).await;
+        paths.sort();
+
+        assert_eq!(paths, vec![
+            "s3://warehouse/t/data/fetched.parquet".to_string(),
+            "s3://warehouse/t/data/inline.parquet".to_string(),
+        ]);
+        config_mock.assert_async().await;
+        load_mock.assert_async().await;
+        plan_mock.assert_async().await;
+        tasks_mock.assert_async().await;
     }
 
     #[tokio::test]
