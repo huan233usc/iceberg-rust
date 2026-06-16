@@ -53,6 +53,7 @@
 
 mod catalog;
 mod client;
+mod scan_planning;
 mod types;
 
 pub use catalog::*;

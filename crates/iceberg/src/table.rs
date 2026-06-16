@@ -28,7 +28,7 @@ use crate::io::object_cache::ObjectCache;
 use crate::runtime::Runtime;
 use crate::scan::TableScanBuilder;
 use crate::spec::{ManifestListReader, SchemaRef, SnapshotRef, TableMetadata, TableMetadataRef};
-use crate::{Error, ErrorKind, Result, TableIdent};
+use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
 /// Builder to create table scan.
 pub struct TableBuilder {
@@ -41,6 +41,7 @@ pub struct TableBuilder {
     disable_cache: bool,
     cache_size_bytes: Option<u64>,
     runtime: Option<Runtime>,
+    catalog: Option<Arc<dyn Catalog>>,
 }
 
 impl TableBuilder {
@@ -55,6 +56,7 @@ impl TableBuilder {
             disable_cache: false,
             cache_size_bytes: None,
             runtime: None,
+            catalog: None,
         }
     }
 
@@ -108,6 +110,16 @@ impl TableBuilder {
         self
     }
 
+    /// optional - sets the catalog handle used for server-side scan planning.
+    ///
+    /// When provided, [`Table::scan`] produces scans that delegate planning to
+    /// [`Catalog::plan_table_scan`] (typically the REST catalog), falling back
+    /// to native, client-side planning if the catalog does not support it.
+    pub fn catalog(mut self, catalog: Arc<dyn Catalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
     /// optional - sets the KMS client used to unwrap keys for table encryption.
     ///
     /// If the table metadata has the `encryption.key-id` property set, a
@@ -130,6 +142,7 @@ impl TableBuilder {
             disable_cache,
             cache_size_bytes,
             runtime,
+            catalog,
         } = self;
 
         let Some(file_io) = file_io else {
@@ -190,6 +203,7 @@ impl TableBuilder {
             object_cache,
             runtime,
             encryption_manager,
+            catalog,
         })
     }
 }
@@ -205,6 +219,9 @@ pub struct Table {
     object_cache: Arc<ObjectCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
+    /// Optional catalog handle injected at load time (e.g. REST), enabling
+    /// server-side scan planning.
+    catalog: Option<Arc<dyn Catalog>>,
 }
 
 impl Table {
@@ -289,6 +306,11 @@ impl Table {
     /// Returns the [`Runtime`] for this table.
     pub(crate) fn runtime(&self) -> &Runtime {
         &self.runtime
+    }
+
+    /// Returns the catalog handle for this table, if one was set.
+    pub(crate) fn catalog(&self) -> Option<Arc<dyn Catalog>> {
+        self.catalog.clone()
     }
 
     /// Returns the flag indicating whether the `Table` is readonly or not

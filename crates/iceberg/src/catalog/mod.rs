@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 use crate::io::StorageFactory;
 use crate::runtime::Runtime;
+use crate::scan::{ScanPlanRequest, ServerScanPlan};
 use crate::spec::{
     EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
     SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
@@ -119,6 +120,20 @@ pub trait Catalog: Debug + Sync + Send {
 
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
+
+    /// Plan a table scan on the server, returning a stream of file scan tasks.
+    ///
+    /// The default implementation returns [`ErrorKind::FeatureUnsupported`],
+    /// which signals the scan engine to fall back to native, client-side
+    /// planning. Catalogs that implement the REST scan-planning protocol
+    /// override this.
+    async fn plan_table_scan(&self, request: ScanPlanRequest) -> Result<ServerScanPlan> {
+        let _ = request;
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "This catalog does not support server-side scan planning",
+        ))
+    }
 }
 
 /// Common interface for all catalog builders.
