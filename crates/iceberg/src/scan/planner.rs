@@ -30,8 +30,21 @@
 //! passed to that method.
 
 use crate::expr::Predicate;
+use crate::io::FileIO;
+use crate::scan::FileScanTaskStream;
 use crate::spec::{SchemaRef, TableMetadataRef};
 use crate::{Error, ErrorKind, Result, TableIdent};
+
+/// The result of a server-side scan plan: the file scan tasks plus an optional
+/// plan-scoped [`FileIO`] built from the credentials the server vended for this
+/// scan. When present, the scan engine reads data files through this `FileIO`
+/// instead of the table's default one.
+pub struct ServerScanPlan {
+    /// The planned file scan tasks.
+    pub tasks: FileScanTaskStream,
+    /// A `FileIO` carrying the plan's vended storage credentials, if any.
+    pub file_io: Option<FileIO>,
+}
 
 /// A neutral, catalog-agnostic description of the scan to be planned remotely.
 ///

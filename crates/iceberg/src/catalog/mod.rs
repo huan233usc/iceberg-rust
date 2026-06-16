@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::io::StorageFactory;
 use crate::runtime::Runtime;
-use crate::scan::{FileScanTaskStream, ScanPlanRequest};
+use crate::scan::{ScanPlanRequest, ServerScanPlan};
 use crate::spec::{
     EncryptedKey, FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot,
     SnapshotReference, SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder,
@@ -127,7 +127,7 @@ pub trait Catalog: Debug + Sync + Send {
     /// which signals the scan engine to fall back to native, client-side
     /// planning. Catalogs that implement the REST scan-planning protocol
     /// override this.
-    async fn plan_table_scan(&self, request: ScanPlanRequest) -> Result<FileScanTaskStream> {
+    async fn plan_table_scan(&self, request: ScanPlanRequest) -> Result<ServerScanPlan> {
         let _ = request;
         Err(Error::new(
             ErrorKind::FeatureUnsupported,
